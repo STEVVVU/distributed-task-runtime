@@ -1,0 +1,6 @@
+.venv/
+bin/
+.runs/
+.audit/
+__pycache__/
+*.pyc

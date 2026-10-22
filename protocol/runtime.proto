@@ -1,0 +1,9 @@
+syntax = "proto3";
+package runtime;
+import "google/protobuf/struct.proto";
+
+// Struct is the interoperable protobuf envelope; operations and fields are
+// validated at the coordinator/worker boundary. No custom JSON wire codec.
+service Runtime {
+  rpc Call(google.protobuf.Struct) returns (google.protobuf.Struct);
+}
