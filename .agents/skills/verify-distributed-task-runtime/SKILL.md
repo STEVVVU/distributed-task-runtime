@@ -29,4 +29,6 @@ The driver's `finally` block terminates and waits only its tracked subprocess ha
 
 # Helpers
 
+The maintained load driver is `tools/benchmark.py`, with reusable process/resource/outcome tooling in `tools/benchmark_support.py`. Start with `python tools/benchmark.py smoke`; see [the frozen benchmark path](features/benchmark.md) before isolated Linux measurement or profiling. All evidence survives owned cleanup.
+
 `tools/verify.py` is the reusable launch, doctor, drive, evidence and cleanup command. Use the feature map to extend an existing journey when behavior changes. Keep the skill current with the maintain-verification-skill workflow.
