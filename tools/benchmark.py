@@ -184,7 +184,7 @@ def main():
                 value = trial(directory / ('trial-'+str(len(summary['trials']))), dict(plan['cell'], repeat=repeat, arm=arm), plan['count'], plan['rate'], binary=plan['binary'], source=source)
                 summary['trials'].append(value)
                 save(directory / 'summary.json', summary)
-                print(json.dumps(dict(repeat=repeat, arm=arm, passed=value['passed'], evidence=str(directory)), flush=True))
+                print(json.dumps(dict(repeat=repeat, arm=arm, passed=value['passed'], evidence=str(directory))), flush=True)
                 if value.get('error') or not value['cleanup']['all_exited'] or not value['cleanup']['sampler_stopped'] or value['cleanup']['errors']:
                     raise RuntimeError(value.get('error', 'cleanup failure'))
             summary['campaign']['completed'] = len(summary['trials']) == 10

@@ -11,6 +11,21 @@ from benchmark_support import load, quantiles,Run
 
 
 class BenchmarkTests(unittest.TestCase):
+    def test_matched_campaign_preserves_all_ten_negative_trials(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary)
+            candidate=root/'candidate';candidate.write_bytes(b'candidate')
+            baseline=root/'baseline';baseline.write_bytes(b'baseline')
+            args=['benchmark.py','matched','--candidate-binary',str(candidate),'--baseline-binary',str(baseline),'--candidate-source','candidate-source','--baseline-source','7ed42c3abe0681108ed5ea972138a23db08427d0']
+            result=dict(passed=False,cleanup=dict(all_exited=True,sampler_stopped=True,errors=[]))
+            with mock.patch.object(benchmark,'ROOT',root),mock.patch.object(benchmark.sys,'argv',args),mock.patch.object(benchmark.sys,'platform','linux'),mock.patch.object(benchmark,'environment',return_value=dict(source='candidate-source')),mock.patch.object(benchmark,'trial',return_value=result) as trial:
+                self.assertEqual(benchmark.main(),1)
+            self.assertEqual(trial.call_count,10)
+            summary=json.loads(next(root.rglob('summary.json')).read_text())
+            self.assertTrue(summary['campaign']['completed'])
+            self.assertEqual(len(summary['trials']),10)
+            self.assertTrue(all(not value['passed'] for value in summary['trials']))
+
     def test_matched_campaign_interleaves_fixed_fixture_and_binary_arms(self):
         plan = list(matched_plan('/candidate/runtime', '/baseline/runtime'))
         self.assertEqual([(item['repeat'], item['arm']) for item in plan], [
