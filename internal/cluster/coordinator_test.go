@@ -127,7 +127,7 @@ func TestBoundaryValidationAndStoreDurability(t *testing.T) {
 	if err := w.Open(path); err != nil {
 		t.Fatal(err)
 	}
-	if err := w.store("task-1", json.RawMessage(`{"x":[1,2]}`)); err != nil {
+	if err := w.store(taskObjectKey("task", 1), json.RawMessage(`{"x":[1,2]}`)); err != nil {
 		t.Fatal(err)
 	}
 	w.DB.Close()
@@ -135,7 +135,7 @@ func TestBoundaryValidationAndStoreDurability(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer w.DB.Close()
-	data, err := w.load("task-1")
+	data, err := w.load(taskObjectKey("task", 1))
 	if err != nil || string(data) != `{"x":[1,2]}` {
 		t.Fatalf("worker object did not survive reopen: %s %v", data, err)
 	}
@@ -152,5 +152,43 @@ func TestFailedCommitDoesNotPublish(t *testing.T) {
 	}
 	if c.state.Objects["must-not-exist"] != nil {
 		t.Fatal("failed commit became visible")
+	}
+}
+
+func TestRootAndTaskStoreNamespacesDoNotOverlap(t *testing.T) {
+	w := &Worker{}
+	if err := w.Open(filepath.Join(t.TempDir(), "worker.db")); err != nil {
+		t.Fatal(err)
+	}
+	defer w.DB.Close()
+	rootKey, taskKey := rootObjectKey("x-1"), taskObjectKey("root-x", 1)
+	if err := w.store(taskKey, json.RawMessage(`99`)); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.store(rootKey, json.RawMessage(`10`)); err != nil {
+		t.Fatal(err)
+	}
+	for key, want := range map[string]string{rootKey: "10", taskKey: "99"} {
+		value, err := w.load(key)
+		if err != nil || string(value) != want {
+			t.Fatalf("key %q returned %s, want %s: %v", key, value, want, err)
+		}
+	}
+}
+
+func TestProtobufAssignmentBudgetRejectsBeforePublication(t *testing.T) {
+	c, _ := setup(t)
+	args := make([]Arg, 4)
+	value := json.RawMessage("[" + strings.Repeat("0,", 49999) + "0]")
+	for i, id := range []string{"one", "two", "three", "four"} {
+		call(t, c, Request{Op: "put", ID: id, Value: value})
+		args[i] = Arg{Kind: "ref", Ref: id}
+	}
+	message, _ := wire.Message(Request{Op: "submit", Task: &Task{ID: "oversized", Module: "examples.functions", Function: "slow", Args: []Arg{{Kind: "list", Items: args}}}})
+	if _, err := c.Call(context.Background(), message.AsMap()); err == nil || !strings.Contains(err.Error(), "assignment exceeds protobuf RPC budget") {
+		t.Fatalf("oversized assignment accepted: %v", err)
+	}
+	if c.state.Tasks["oversized"] != nil || c.state.Objects["oversized"] != nil {
+		t.Fatal("rejected assignment was published")
 	}
 }

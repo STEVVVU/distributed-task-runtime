@@ -2,9 +2,11 @@ package wire
 
 import (
 	"context"
+	"encoding/json"
 	"google.golang.org/protobuf/types/known/structpb"
 	"math"
 	"net"
+	"strings"
 	"testing"
 	"time"
 )
@@ -57,5 +59,23 @@ func TestNonfiniteProtobufNumberRejectedBeforeJSONConversion(t *testing.T) {
 	})
 	if _, err = handler.Call(context.Background(), message); err == nil {
 		t.Fatal("nonfinite protobuf number accepted")
+	}
+}
+
+func TestObjectMustFitProtobufFetchResponse(t *testing.T) {
+	value := json.RawMessage("[" + strings.Repeat("0,", 199999) + "0]")
+	if err := ValidateObject(value); err == nil || !strings.Contains(err.Error(), "protobuf RPC budget") {
+		t.Fatalf("unfetchable object accepted: %v", err)
+	}
+}
+
+func TestLoopbackAddressHasBoundedNumericPort(t *testing.T) {
+	for _, address := range []string{"127.0.0.1:0", "127.0.0.1:-1", "127.0.0.1:65536", "127.0.0.1:abc", "127.0.0.1:000001", "192.0.2.1:80"} {
+		if Loopback(address) {
+			t.Fatalf("invalid peer accepted: %s", address)
+		}
+	}
+	if !Loopback("127.0.0.1:7100") || !Loopback("[::1]:7100") {
+		t.Fatal("valid loopback peers rejected")
 	}
 }

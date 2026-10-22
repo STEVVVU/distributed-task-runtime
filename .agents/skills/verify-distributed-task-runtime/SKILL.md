@@ -9,6 +9,8 @@ Build `go build -o bin/runtime.exe ./cmd/runtime`. Install the pinned `requireme
 
 Final proof after shutdown/finite-number checks and stricter lost-result assertions is `.runs/20261021-194311-0d2511/evidence.json`. It records one peer transfer for the join, zero extra transfers for the local consumer, worker-loss retry from attempt 1 to 2, and coordinator-restart retry from attempt 1 to 2. All tracked processes exited and the evidence remained after cleanup.
 
+Independent-review follow-up adds root/task key-namespace and protobuf-size regressions. Collision red evidence is `.runs/20261021-194718-9dd825/evidence.json`; oversized accepted-assignment red evidence is `.runs/20261021-194838-523a15/evidence.json`. Final green proof is `.runs/20261021-195504-bd28f6/evidence.json`, including the completed-result precondition before coordinator restart. `.github/workflows/ci.yml` drives this same command and retains its evidence; a hosted run remains unverified until authorized publication.
+
 # Doctor
 
 The driver calls authenticated `Status` through the Python gRPC client, waits for both worker IDs and checks all owned process handles. No user cluster is reused.

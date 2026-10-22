@@ -14,6 +14,7 @@ import (
 
 	"distributed-task-runtime/internal/wire"
 	bolt "go.etcd.io/bbolt"
+	"google.golang.org/protobuf/proto"
 )
 
 type Coordinator struct {
@@ -143,16 +144,19 @@ func (c *Coordinator) Call(ctx context.Context, m map[string]any) (any, error) {
 	// Durable state changes become visible only after bbolt commits successfully.
 	before, _ := json.Marshal(c.state)
 	out, err := c.handle(r)
+	snapshot, encodeErr := wire.Message(out)
+	if err == nil {
+		err = encodeErr
+	}
+	if err == nil && proto.Size(snapshot) > wire.MaxMessage {
+		err = errors.New("reply exceeds protobuf RPC budget")
+	}
 	if err == nil {
 		err = c.save(c.state)
 	}
 	if err != nil {
 		c.state = State{}
 		_ = json.Unmarshal(before, &c.state)
-		return nil, err
-	}
-	snapshot, err := wire.Message(out)
-	if err != nil {
 		return nil, err
 	}
 	return snapshot.AsMap(), nil
@@ -169,6 +173,9 @@ func (c *Coordinator) handle(r Request) (any, error) {
 	case "put":
 		if !identifier.MatchString(r.ID) || len(r.Value) == 0 || len(r.Value) > wire.MaxObject {
 			return nil, errors.New("invalid root object")
+		}
+		if err := wire.ValidateObject(r.Value); err != nil {
+			return nil, err
 		}
 		var value any
 		if err := json.Unmarshal(r.Value, &value); err != nil {
@@ -242,6 +249,18 @@ func (c *Coordinator) handle(r Request) (any, error) {
 		t.Worker = ""
 		t.Error = ""
 		t.Created = time.Now().UnixMilli()
+		inputs := map[string]Spec{}
+		for _, id := range t.Deps {
+			inputs[id] = Spec{Root: c.state.Objects[id].Root, Locations: map[string]Location{}}
+		}
+		candidate, err := wire.Message(Assignment{Task: t, Inputs: inputs})
+		if err != nil {
+			return nil, err
+		}
+		// Reserve one bounded owner location per dependency and assignment metadata.
+		if proto.Size(candidate)+1024*(len(t.Deps)+1) > wire.MaxMessage {
+			return nil, errors.New("assignment exceeds protobuf RPC budget")
+		}
 		c.state.Tasks[t.ID] = t
 		c.state.Objects[t.ID] = &Object{ID: t.ID, Locations: map[string]Location{}}
 		return map[string]any{"id": t.ID}, nil
@@ -365,7 +384,7 @@ func (c *Coordinator) handle(r Request) (any, error) {
 			t.Error = r.Error
 		} else {
 			t.State = "done"
-			c.state.Objects[t.ID].Locations[r.Worker] = Location{Address: n.Address, Key: fmt.Sprintf("%s-%d", t.ID, t.Attempt)}
+			c.state.Objects[t.ID].Locations[r.Worker] = Location{Address: n.Address, Key: taskObjectKey(t.ID, t.Attempt)}
 		}
 		return map[string]any{"accepted": true}, nil
 	default:

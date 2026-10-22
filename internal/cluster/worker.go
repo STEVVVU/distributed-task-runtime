@@ -40,8 +40,8 @@ func (w *Worker) load(key string) (json.RawMessage, error) {
 	return data, err
 }
 func (w *Worker) store(key string, value json.RawMessage) error {
-	if len(value) > wire.MaxObject || !json.Valid(value) {
-		return errors.New("invalid or oversized object")
+	if err := wire.ValidateObject(value); err != nil {
+		return err
 	}
 	return w.DB.Update(func(tx *bolt.Tx) error { return tx.Bucket([]byte("objects")).Put([]byte(key), value) })
 }
@@ -111,7 +111,7 @@ func (w *Worker) execute(ctx context.Context, a Assignment) (int, error) {
 	values := map[string]any{}
 	transfers := 0
 	for id, spec := range a.Inputs {
-		key := "root-" + id
+		key := rootObjectKey(id)
 		if len(spec.Root) == 0 {
 			for _, loc := range spec.Locations {
 				key = loc.Key
@@ -181,7 +181,7 @@ func (w *Worker) execute(ctx context.Context, a Assignment) (int, error) {
 	if result.Error != "" {
 		return transfers, errors.New(result.Error)
 	}
-	return transfers, w.store(fmt.Sprintf("%s-%d", a.Task.ID, a.Task.Attempt), result.Value)
+	return transfers, w.store(taskObjectKey(a.Task.ID, a.Task.Attempt), result.Value)
 }
 func resolve(a Arg, values map[string]any) any {
 	switch a.Kind {

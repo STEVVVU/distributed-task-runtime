@@ -5,6 +5,6 @@ heartbeat loss, bounded retries, durable lineage, root retention, restart fencin
 ## How to get to it (user POV)
 Submit deterministic pure functions and wait on their references.
 ## Driving it with tools/verify.py
-Kill an assigned worker; await reconstruction of pending work and lost outputs. Restart the coordinator with its persisted database. Replay old attempts and identical requests; require stale rejection and duplicate acceptance.
+Kill an assigned worker; await reconstruction of pending work and lost outputs. Before the separate coordinator fault, call `get` on the DAG result and record its completed task metadata so accepted-publication preservation has a completed precondition. Restart the coordinator with its persisted database. Replay old attempts and identical requests; require stale rejection and duplicate acceptance.
 ## Gotchas
 Retries can repeat side effects. Only pure tasks are supported. A lost coordinator disk is unrecoverable; this is a single durable coordinator, not consensus or HA.

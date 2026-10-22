@@ -12,6 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 import grpc
+from google.protobuf import json_format, struct_pb2
 from examples import functions
 from taskruntime import ObjectRef, Runtime, TaskError
 from taskruntime.client import rpc
@@ -87,6 +88,30 @@ def main():
         assert all(p.poll() is None for p in processes)
         evidence["doctor"] = {"nodes": list(status()["nodes"]), "owned_processes_alive": True}
 
+        large_roots = [client.put([0] * 50000) for _ in range(4)]
+        minimum_assignment = struct_pb2.Struct()
+        json_format.ParseDict({"inputs": {ref.id: {"root": [0] * 50000, "locations": {}} for ref in large_roots}}, minimum_assignment)
+        assignment_bytes = minimum_assignment.ByteSize()
+        assert assignment_bytes > 2 << 20
+        try:
+            oversized = client.remote(functions.slow).remote(large_roots, seconds=0)
+        except grpc.RpcError as error:
+            assert "assignment exceeds protobuf RPC budget" in str(error), str(error)
+            evidence["assignment_size_boundary"] = {"rejected": True, "minimum_protobuf_bytes": assignment_bytes, "error": error.details()}
+        else:
+            assigned = wait(lambda: task(oversized) if task(oversized)["state"] == "running" else None)
+            evidence["assignment_size_boundary"] = {"rejected": False, "minimum_protobuf_bytes": assignment_bytes, "accepted_task": assigned, "node_state": status()["nodes"]}
+            raise AssertionError("oversized protobuf assignment was accepted and leased")
+
+        client.call({"op": "put", "id": "x-1", "value": 10})
+        collision_task = {"id": "root-x", "module": "examples.functions", "function": "add", "args": [{"kind": "literal", "value": 40}, {"kind": "literal", "value": 59}], "kwargs": {}}
+        client.call({"op": "submit", "task": collision_task})
+        assert client.get(ObjectRef("root-x")) == 99
+        consumer = client.remote(functions.add).remote(ObjectRef("x-1"), 1)
+        observed = client.get(consumer)
+        evidence["root_cache_namespace"] = {"root_id": "x-1", "producer_id": "root-x", "producer": task(ObjectRef("root-x")), "consumer": task(consumer), "expected": 11, "observed": observed}
+        assert observed == 11, f"root/cache namespace collision: expected 11, observed {observed}"
+
         add, slow, total = [client.remote(f) for f in (functions.add, functions.slow, functions.total)]
         root = client.put(10)
         assert client.get(root) == 10
@@ -150,9 +175,13 @@ def main():
         rejected(lambda: client.call(stale), "stale attempt", grpc.RpcError)
         evidence["worker_loss"] = {"before": assigned, "after": recovered, "reconstructed_output": task(lost_output), "stale_rejected": True}
 
+        assert client.get(branch) == 32
+
         restart_pending = slow.remote(root, seconds=3)
         restart_assigned = wait(lambda: task(restart_pending) if task(restart_pending)["state"] == "running" else None)
         accepted_before = task(branch)
+        evidence["restart_precondition"] = {"accepted_before": accepted_before}
+        assert accepted_before["state"] == "done"
         stop(coordinator)
         coordinator = launch("coordinator", "coordinator", address)
         wait(status)

@@ -1,0 +1,63 @@
+name: Verify distributed task runtime
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    env:
+      GOTOOLCHAIN: local
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: 1.27.3
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.11'
+      - name: Install pinned Python runtime
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          python -m venv .venv
+          .venv/Scripts/python.exe -m pip install -r requirements.lock
+      - name: Check Go formatting
+        shell: pwsh
+        run: |
+          $unformatted = gofmt -l cmd internal
+          if ($unformatted) { throw "Unformatted Go source: $unformatted" }
+      - name: Test Go
+        run: go test ./...
+      - name: Vet Go
+        run: go vet ./...
+      - name: Build runtime
+        run: go build -o bin/runtime.exe ./cmd/runtime
+      - name: Test Python
+        run: .venv/Scripts/python.exe -m unittest discover -s tests -v
+      - name: Drive actual cluster and recovery journeys
+        run: .venv/Scripts/python.exe tools/verify.py
+      - name: Audit Go dependencies
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
+      - name: Audit Python runtime dependencies
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          .venv/Scripts/python.exe -m pip install pip-audit==2.10.1
+          .venv/Scripts/python.exe -m pip_audit -r requirements.lock
+      - name: Retain process evidence
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: runtime-evidence
+          path: .runs/
+          include-hidden-files: true
+          if-no-files-found: warn
+          retention-days: 7

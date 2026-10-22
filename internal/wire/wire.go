@@ -7,6 +7,7 @@ import (
 	"errors"
 	"math"
 	"net"
+	"strconv"
 	"time"
 
 	"google.golang.org/grpc"
@@ -14,11 +15,26 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/structpb"
 )
 
 const MaxMessage = 2 << 20
 const MaxObject = 1 << 20
+
+func ValidateObject(value json.RawMessage) error {
+	if len(value) > MaxObject || !json.Valid(value) {
+		return errors.New("invalid or oversized object")
+	}
+	message, err := Message(map[string]any{"value": value})
+	if err != nil {
+		return err
+	}
+	if proto.Size(message) > MaxMessage-1024 {
+		return errors.New("object exceeds protobuf RPC budget")
+	}
+	return nil
+}
 
 type Handler interface {
 	Call(context.Context, *structpb.Struct) (*structpb.Struct, error)
@@ -77,9 +93,10 @@ func Decode(m map[string]any, v any) error {
 	return json.Unmarshal(b, v)
 }
 func Loopback(address string) bool {
-	host, _, err := net.SplitHostPort(address)
+	host, port, err := net.SplitHostPort(address)
 	ip := net.ParseIP(host)
-	return err == nil && ip != nil && ip.IsLoopback()
+	portNumber, portErr := strconv.Atoi(port)
+	return err == nil && portErr == nil && portNumber > 0 && portNumber <= 65535 && len(port) <= 5 && ip != nil && ip.IsLoopback()
 }
 func Serve(ctx context.Context, address, token string, service Service) error {
 	if !Loopback(address) || len(token) < 24 {

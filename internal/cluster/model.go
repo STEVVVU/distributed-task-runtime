@@ -3,11 +3,15 @@ package cluster
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math"
 	"regexp"
 )
 
 const MaxAttempts = 3
+
+func rootObjectKey(id string) string              { return "root:" + id }
+func taskObjectKey(id string, attempt int) string { return fmt.Sprintf("task:%s:%d", id, attempt) }
 
 type Arg struct {
 	Kind   string         `json:"kind"`
