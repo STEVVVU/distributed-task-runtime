@@ -7,7 +7,9 @@ import os
 from pathlib import Path
 import secrets
 import sys
+import threading
 import time
+import urllib.request
 
 from benchmark_support import Run, environment, load, save
 from verify import port, wait
@@ -18,6 +20,18 @@ from examples import functions
 from taskruntime import Runtime
 
 WORKLOAD = dict(version=1, seed=421, workers=[1, 2, 4], object_items=[16, 4096, 32768], seconds=[0, .02, .2], concurrency=[1, 8, 32], count=32, repeats=5, rates=[1, 4, 16], sweep_seconds=10, stability_seconds=120)
+PROFILE_SECONDS=20
+
+
+def capture_profile(endpoint,path):
+    started=time.monotonic()
+    started_unix_ns=time.time_ns()
+    url=f'http://{endpoint}/debug/pprof/profile?seconds={PROFILE_SECONDS}'
+    with urllib.request.urlopen(url,timeout=PROFILE_SECONDS+5) as response:
+        data=response.read((8<<20)+1)
+    assert 0<len(data)<=8<<20 and data.startswith(b'\x1f\x8b'),'missing, oversized or invalid native CPU profile'
+    path.write_bytes(data)
+    return dict(file=path.name,bytes=len(data),sha256=hashlib.sha256(data).hexdigest(),request=url,request_started=started,request_started_unix_ns=started_unix_ns,response_finished=time.monotonic(),response_finished_unix_ns=time.time_ns(),requested_seconds=PROFILE_SECONDS)
 
 
 def cells():
@@ -32,19 +46,27 @@ def cells():
 
 
 def trial(path, cell, count, rate=None, fault=None, profile=False):
-    run = Run(path)
+    run = Run(path,capture_descendants=profile)
     result = dict(passed=False, cell=cell, rate=rate, fault=fault)
     token, address = secrets.token_urlsafe(32), port()
     client = Runtime(address, token)
     env = dict(os.environ, TASK_RUNTIME_TOKEN=token, PYTHONPATH=str(ROOT))
+    env.pop('TASK_RUNTIME_PROFILE_ADDR',None)
     if profile:
         env['GODEBUG'] = 'schedtrace=1000,gctrace=1'
-    binary = ROOT / 'bin' / ('runtime.exe' if os.name == 'nt' else 'runtime')
+    name='runtime-profile' if profile else 'runtime'
+    binary = ROOT / 'bin' / (name+'.exe' if os.name == 'nt' else name)
+    endpoints={};profile_threads=[];profiles={};profile_errors=[]
     def launch(role, name, endpoint):
-        return run.launch(name, [str(binary), '-role', role, '-address', endpoint, '-coordinator', address, '-id', name, '-data', str(run.path / (name+'.db')), '-python', sys.executable], env)
+        node_env=dict(env)
+        if profile:
+            endpoints[name]=port()
+            node_env['TASK_RUNTIME_PROFILE_ADDR']=endpoints[name]
+        return run.launch(name, [str(binary), '-role', role, '-address', endpoint, '-coordinator', address, '-id', name, '-data', str(run.path / (name+'.db')), '-python', sys.executable], node_env)
     def status():
         return client.call({'op': 'status'})
     try:
+        if profile:result['profile_build']=dict(tag='benchmark',binary=str(binary),sha256=hashlib.sha256(binary.read_bytes()).hexdigest())
         coordinator = launch('coordinator', 'coordinator', address)
         wait(status)
         workers = {f'worker-{i}': launch('worker', f'worker-{i}', port()) for i in range(cell['workers'])}
@@ -79,6 +101,13 @@ def trial(path, cell, count, rate=None, fault=None, profile=False):
         if not fault:
             result['warmup'] = action(-1)
         result['before'] = status()
+        if profile:
+            def capture(name,endpoint):
+                try:profiles[name]=capture_profile(endpoint,run.path/(name+'.pprof'))
+                except Exception as error:profile_errors.append(dict(name=name,error=repr(error)))
+            for name,endpoint in endpoints.items():
+                thread=threading.Thread(target=capture,args=(name,endpoint),daemon=True)
+                thread.start();profile_threads.append(thread)
         result['load'] = load(action, count, cell['concurrency'], rate)
         result['after'] = status()
         result['transfers'] = sum(n['transfers'] for n in result['after']['nodes'].values()) - sum(n['transfers'] for n in result['before']['nodes'].values())
@@ -86,6 +115,14 @@ def trial(path, cell, count, rate=None, fault=None, profile=False):
     except Exception as error:
         result['error'] = repr(error)
     finally:
+        if profile:
+            for thread in profile_threads:thread.join(timeout=PROFILE_SECONDS+10)
+            result['native_profiles']=profiles
+            result['native_profile_errors']=profile_errors
+            result['profile_threads_stopped']=all(not thread.is_alive() for thread in profile_threads)
+            result['native_profiles_passed']=set(profiles)==set(endpoints)=={'coordinator','worker-0','worker-1'} and all((run.path/proof['file']).is_file() and (run.path/proof['file']).stat().st_size for proof in profiles.values()) and not profile_errors and result['profile_threads_stopped']
+            result['profile_scope']='Benchmark-tag binary only. Parallel native Go CPU profiles requested around the exact failed offered-load cell after warmup, with 20-second bounded windows and receipts. Windows may include idle drain time or end before an unusually long drain; compare native profile timestamps with retained load start/end. Python generator cProfile and descendant/reaped-child resource counters are separate; profile timings are diagnostic only.'
+            result['passed']=result['passed'] and result['native_profiles_passed']
         result['cleanup'] = run.cleanup()
         result['passed'] = result['passed'] and result['cleanup']['all_exited'] and not result['cleanup']['errors']
         save(run.path / 'result.json', result)
@@ -115,10 +152,11 @@ def main():
         elif args.mode == 'profile':
             profiler = cProfile.Profile()
             profiler.enable()
-            run(dict(workers=2, object_items=4096, seconds=.02, concurrency=8))
-            profiler.disable()
-            profiler.dump_stats(str(directory / 'generator.pstats'))
-            summary['profile_scope'] = 'Generator cProfile and Go scheduler/GC traces. No runtime CPU-profile endpoint exists; service hot-path CPU profiling remains a prerequisite before cause-dependent fixes.'
+            try:run(dict(workers=2, object_items=4096, seconds=.02, concurrency=32),160,16)
+            finally:
+                profiler.disable()
+                profiler.dump_stats(str(directory / 'generator.pstats'))
+            summary['profile_scope'] = 'Native coordinator/two-worker CPU pprof plus generator cProfile and Go scheduler/GC traces on the unchanged failed 16 DAG/s, ten-second cell. Diagnostic timings are excluded from comparisons.'
         else:
             matrix = cells()
             for repeat in range(WORKLOAD['repeats']):

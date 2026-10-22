@@ -31,11 +31,12 @@ def environment(root):
 
 
 class Run:
-    def __init__(self, path):
+    def __init__(self, path, capture_descendants=False):
         self.path = Path(path)
         self.path.mkdir(parents=True, exist_ok=False)
         assert shutil.disk_usage(self.path).free >= 10 * 1024**3, '10GiB free disk required'
         self.processes, self.logs, self.resources = [], [], []
+        self.capture_descendants=capture_descendants
         self.done = threading.Event()
         self.thread = threading.Thread(target=self.monitor, daemon=True)
         self.thread.start()
@@ -70,13 +71,27 @@ class Run:
             stat = Path(f'/proc/{pid}/stat').read_text().rsplit(') ', 1)[1].split()
             status = Path(f'/proc/{pid}/status').read_text().splitlines()
             rss = next((int(line.split()[1])*1024 for line in status if line.startswith('VmRSS:')), 0)
-            return dict(pid=pid, cpu_ticks=int(stat[11])+int(stat[12]), rss_bytes=rss)
+            return dict(pid=pid,parent_pid=int(stat[1]),start_time_ticks=int(stat[19]),cpu_ticks=int(stat[11])+int(stat[12]),reaped_child_cpu_ticks=int(stat[13])+int(stat[14]),rss_bytes=rss)
         except (FileNotFoundError, ProcessLookupError):
             return None
 
+    @staticmethod
+    def descendants(pid):
+        values=[]
+        children=set()
+        for task in Path(f'/proc/{pid}/task').glob('*/children'):
+            try:children.update(task.read_text().split())
+            except (FileNotFoundError,ProcessLookupError):continue
+        for child in children:
+            process=Run.proc(int(child))
+            if process is not None and process['parent_pid']==pid:
+                values.append(process)
+                values.extend(Run.descendants(process['pid']))
+        return values
+
     def monitor(self):
         while not self.done.is_set():
-            self.resources.append(dict(at=time.perf_counter(), generator=self.proc(os.getpid()), processes=[dict(name=name, process=self.proc(p.pid)) for name, p in list(self.processes)]))
+            self.resources.append(dict(at=time.perf_counter(), generator=self.proc(os.getpid()), processes=[dict(name=name,process=self.proc(p.pid),**(dict(descendants=self.descendants(p.pid)) if self.capture_descendants and os.name!='nt' and p.poll() is None else {})) for name,p in list(self.processes)]))
             self.done.wait(.1)
 
     def cleanup(self):

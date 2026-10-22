@@ -28,6 +28,11 @@ func main() {
 	if !wire.Loopback(*address) || !wire.Loopback(*coordinator) {
 		log.Fatal("only loopback addresses are supported")
 	}
+	stopProfile, err := startBenchmarkProfile()
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer stopProfile()
 	if err := os.MkdirAll(filepath.Dir(*data), 0700); err != nil {
 		log.Fatal(err)
 	}
