@@ -4,8 +4,8 @@ on:
     inputs:
       mode:
         type: choice
-        description: Isolated measurement or separate diagnostic profile
-        options: [benchmark, profile]
+        description: Isolated measurement, diagnostic profile or matched comparison
+        options: [benchmark, profile, matched]
         default: benchmark
 permissions:
   contents: read
@@ -33,6 +33,20 @@ jobs:
       - run: go test ./...
       - run: go vet ./...
       - run: go build -o bin/runtime ./cmd/runtime
+      - if: inputs.mode == 'matched'
+        shell: bash
+        run: |
+          commit=7ed42c3abe0681108ed5ea972138a23db08427d0
+          git fetch --no-tags origin "$commit"
+          git worktree add --detach "$RUNNER_TEMP/baseline" "$commit"
+          mkdir -p "$RUNNER_TEMP/baseline-bin"
+          mkdir -p "$RUNNER_TEMP/candidate-bin"
+          GOCACHE="$RUNNER_TEMP/go-cache-baseline" go -C "$RUNNER_TEMP/baseline" build -o "$RUNNER_TEMP/baseline-bin/runtime" ./cmd/runtime
+          GOCACHE="$RUNNER_TEMP/go-cache-candidate" go build -o "$RUNNER_TEMP/candidate-bin/runtime" ./cmd/runtime
+          echo "BASELINE_BINARY=$RUNNER_TEMP/baseline-bin/runtime" >> "$GITHUB_ENV"
+          echo "CANDIDATE_BINARY=$RUNNER_TEMP/candidate-bin/runtime" >> "$GITHUB_ENV"
+          echo "BASELINE_SOURCE=$commit" >> "$GITHUB_ENV"
+          echo "CANDIDATE_SOURCE=$GITHUB_SHA" >> "$GITHUB_ENV"
       - if: inputs.mode == 'profile'
         run: go test -tags benchmark ./cmd/runtime
       - if: inputs.mode == 'profile'
@@ -41,7 +55,16 @@ jobs:
         run: go build -tags benchmark -o bin/runtime-profile ./cmd/runtime
       - run: python -m unittest discover -s tools -p test_benchmark.py -v
       - run: python tools/benchmark.py smoke
-      - run: python tools/benchmark.py ${{ inputs.mode }}
+      - if: inputs.mode != 'matched'
+        run: python tools/benchmark.py ${{ inputs.mode }}
+      - if: inputs.mode == 'matched'
+        run: python tools/benchmark.py smoke --binary "$CANDIDATE_BINARY"
+      - if: inputs.mode == 'matched'
+        run: python tools/benchmark.py smoke --binary "$BASELINE_BINARY"
+      - if: inputs.mode == 'matched'
+        run: python tools/verify.py
+      - if: inputs.mode == 'matched'
+        run: python tools/benchmark.py matched --candidate-binary "$CANDIDATE_BINARY" --baseline-binary "$BASELINE_BINARY" --candidate-source "$CANDIDATE_SOURCE" --baseline-source "$BASELINE_SOURCE"
       - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
         if: always()
         with:

@@ -142,7 +142,8 @@ func TestBoundaryValidationAndStoreDurability(t *testing.T) {
 }
 
 func TestFailedCommitDoesNotPublish(t *testing.T) {
-	c, _ := setup(t)
+	c, path := setup(t)
+	call(t, c, Request{Op: "put", ID: "accepted", Value: json.RawMessage(`{"answer":42}`)})
 	if err := c.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -152,6 +153,17 @@ func TestFailedCommitDoesNotPublish(t *testing.T) {
 	}
 	if c.state.Objects["must-not-exist"] != nil {
 		t.Fatal("failed commit became visible")
+	}
+	if c.state.Objects["accepted"] == nil || string(c.state.Objects["accepted"].Root) != `{"answer":42}` {
+		t.Fatal("failed commit lost previously committed state")
+	}
+	reopened, err := OpenCoordinator(path, "examples.functions")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	if reopened.state.Objects["must-not-exist"] != nil || string(reopened.state.Objects["accepted"].Root) != `{"answer":42}` {
+		t.Fatal("rollback disagrees with durable state after reopen")
 	}
 }
 

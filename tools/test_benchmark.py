@@ -6,11 +6,24 @@ import json
 import tempfile
 import benchmark
 import benchmark_support
-from benchmark import cells,capture_profile
+from benchmark import cells,capture_profile,matched_plan
 from benchmark_support import load, quantiles,Run
 
 
 class BenchmarkTests(unittest.TestCase):
+    def test_matched_campaign_interleaves_fixed_fixture_and_binary_arms(self):
+        plan = list(matched_plan('/candidate/runtime', '/baseline/runtime'))
+        self.assertEqual([(item['repeat'], item['arm']) for item in plan], [
+            (0, 'candidate'), (0, 'baseline'), (1, 'baseline'), (1, 'candidate'),
+            (2, 'candidate'), (2, 'baseline'), (3, 'baseline'), (3, 'candidate'),
+            (4, 'candidate'), (4, 'baseline'),
+        ])
+        self.assertEqual({item['binary'] for item in plan}, {'/candidate/runtime', '/baseline/runtime'})
+        self.assertEqual({(item['count'], item['rate']) for item in plan}, {(160, 16)})
+        self.assertEqual({tuple(item['cell'].items()) for item in plan}, {
+            (('workers', 2), ('object_items', 4096), ('seconds', .02), ('concurrency', 32))
+        })
+
     def test_cells_cover_each_frozen_axis(self):
         values = cells()
         self.assertEqual({v['workers'] for v in values}, {1, 2, 4})
@@ -51,7 +64,7 @@ class BenchmarkTests(unittest.TestCase):
             self.assertFalse(path.exists())
 
     def test_profile_reuses_failed_frozen_offered_cell(self):
-        def trial(path,cell,count,rate,fault,profile):
+        def trial(path,cell,count,rate,fault,profile,binary=None):
             self.assertEqual(cell,dict(workers=2,object_items=4096,seconds=.02,concurrency=32))
             self.assertEqual((count,rate,fault,profile),(160,16,None,True))
             return dict(passed=False,native_profiles_passed=True,cleanup=dict(all_exited=True))

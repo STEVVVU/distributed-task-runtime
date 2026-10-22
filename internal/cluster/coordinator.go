@@ -18,10 +18,11 @@ import (
 )
 
 type Coordinator struct {
-	mu      sync.Mutex
-	db      *bolt.DB
-	state   State
-	modules map[string]bool
+	mu        sync.Mutex
+	db        *bolt.DB
+	state     State
+	modules   map[string]bool
+	committed []byte
 }
 
 func OpenCoordinator(path, modules string) (*Coordinator, error) {
@@ -69,7 +70,11 @@ func (c *Coordinator) save(s State) error {
 	if err != nil {
 		return err
 	}
-	return c.db.Update(func(tx *bolt.Tx) error { return tx.Bucket([]byte("runtime")).Put([]byte("state"), b) })
+	if err := c.db.Update(func(tx *bolt.Tx) error { return tx.Bucket([]byte("runtime")).Put([]byte("state"), b) }); err != nil {
+		return err
+	}
+	c.committed = b
+	return nil
 }
 func (c *Coordinator) retry(t *Task, reason string) {
 	t.Worker = ""
@@ -123,12 +128,11 @@ func (c *Coordinator) Run(ctx context.Context) {
 			return
 		case <-ticker.C:
 			c.mu.Lock()
-			old, _ := json.Marshal(c.state)
 			c.expire()
 			if err := c.save(c.state); err != nil {
 				log.Printf("metadata expiration commit failed: %v", err)
 				c.state = State{}
-				_ = json.Unmarshal(old, &c.state)
+				_ = json.Unmarshal(c.committed, &c.state)
 			}
 			c.mu.Unlock()
 		}
@@ -142,7 +146,6 @@ func (c *Coordinator) Call(ctx context.Context, m map[string]any) (any, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	// Durable state changes become visible only after bbolt commits successfully.
-	before, _ := json.Marshal(c.state)
 	out, err := c.handle(r)
 	snapshot, encodeErr := wire.Message(out)
 	if err == nil {
@@ -156,7 +159,7 @@ func (c *Coordinator) Call(ctx context.Context, m map[string]any) (any, error) {
 	}
 	if err != nil {
 		c.state = State{}
-		_ = json.Unmarshal(before, &c.state)
+		_ = json.Unmarshal(c.committed, &c.state)
 		return nil, err
 	}
 	return snapshot.AsMap(), nil

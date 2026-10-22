@@ -45,7 +45,15 @@ def cells():
     return result
 
 
-def trial(path, cell, count, rate=None, fault=None, profile=False):
+def matched_plan(candidate, baseline, repeats=5):
+    fixture = dict(workers=2, object_items=4096, seconds=.02, concurrency=32)
+    for repeat in range(repeats):
+        arms = [('candidate', candidate), ('baseline', baseline)]
+        for arm, binary in (arms if repeat % 2 == 0 else reversed(arms)):
+            yield dict(repeat=repeat, arm=arm, binary=binary, cell=dict(fixture), count=160, rate=16)
+
+
+def trial(path, cell, count, rate=None, fault=None, profile=False, binary=None, source=None):
     run = Run(path,capture_descendants=profile)
     result = dict(passed=False, cell=cell, rate=rate, fault=fault)
     token, address = secrets.token_urlsafe(32), port()
@@ -55,7 +63,7 @@ def trial(path, cell, count, rate=None, fault=None, profile=False):
     if profile:
         env['GODEBUG'] = 'schedtrace=1000,gctrace=1'
     name='runtime-profile' if profile else 'runtime'
-    binary = ROOT / 'bin' / (name+'.exe' if os.name == 'nt' else name)
+    binary = Path(binary) if binary else ROOT / 'bin' / (name+'.exe' if os.name == 'nt' else name)
     endpoints={};profile_threads=[];profiles={};profile_errors=[]
     def launch(role, name, endpoint):
         node_env=dict(env)
@@ -66,7 +74,8 @@ def trial(path, cell, count, rate=None, fault=None, profile=False):
     def status():
         return client.call({'op': 'status'})
     try:
-        if profile:result['profile_build']=dict(tag='benchmark',binary=str(binary),sha256=hashlib.sha256(binary.read_bytes()).hexdigest())
+        result['build'] = dict(binary=str(binary), sha256=hashlib.sha256(binary.read_bytes()).hexdigest(), source=source)
+        if profile:result['profile_build']=dict(tag='benchmark',**result['build'])
         coordinator = launch('coordinator', 'coordinator', address)
         wait(status)
         workers = {f'worker-{i}': launch('worker', f'worker-{i}', port()) for i in range(cell['workers'])}
@@ -131,7 +140,12 @@ def trial(path, cell, count, rate=None, fault=None, profile=False):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('mode', choices=['smoke', 'benchmark', 'profile'], default='smoke', nargs='?')
+    parser.add_argument('mode', choices=['smoke', 'benchmark', 'profile', 'matched'], default='smoke', nargs='?')
+    parser.add_argument('--binary')
+    parser.add_argument('--candidate-binary')
+    parser.add_argument('--baseline-binary')
+    parser.add_argument('--candidate-source')
+    parser.add_argument('--baseline-source')
     args = parser.parse_args()
     assert args.mode == 'smoke' or sys.platform == 'linux', 'measurement requires isolated Linux runner'
     directory = ROOT / '.runs' / ('benchmark-'+args.mode+'-'+str(time.time_ns()))
@@ -139,7 +153,7 @@ def main():
     summary = dict(passed=False, mode=args.mode, environment=environment(ROOT), workload=WORKLOAD, trials=[])
     def run(cell, count=WORKLOAD['count'], rate=None, fault=None):
         index = len(summary['trials'])
-        value = trial(directory / ('trial-'+str(index)), cell, count, rate, fault, args.mode == 'profile')
+        value = trial(directory / ('trial-'+str(index)), cell, count, rate, fault, args.mode == 'profile', args.binary)
         summary['trials'].append(value)
         save(directory / 'summary.json', summary)
         print(json.dumps(dict(trial=index, passed=value['passed'], evidence=str(directory))), flush=True)
@@ -157,6 +171,23 @@ def main():
                 profiler.disable()
                 profiler.dump_stats(str(directory / 'generator.pstats'))
             summary['profile_scope'] = 'Native coordinator/two-worker CPU pprof plus generator cProfile and Go scheduler/GC traces on the unchanged failed 16 DAG/s, ten-second cell. Diagnostic timings are excluded from comparisons.'
+        elif args.mode == 'matched':
+            assert args.candidate_binary and args.baseline_binary and args.candidate_source and args.baseline_source
+            assert Path(args.candidate_binary).resolve()!=Path(args.baseline_binary).resolve(),'matched binaries must have distinct paths'
+            assert hashlib.sha256(Path(args.candidate_binary).read_bytes()).digest()!=hashlib.sha256(Path(args.baseline_binary).read_bytes()).digest(),'matched binaries must be independently built'
+            assert args.baseline_source=='7ed42c3abe0681108ed5ea972138a23db08427d0' and args.candidate_source==summary['environment']['source'] and args.candidate_source!=args.baseline_source,'matched source identity mismatch'
+            base = dict(workers=2, object_items=4096, seconds=.02, concurrency=32)
+            summary['campaign'] = dict(repeats=5, arms='candidate/baseline interleaved; reversed on odd repeats', count=160, rate=16, seconds=10, fixture=base, candidate_source=args.candidate_source, baseline_source=args.baseline_source)
+            for plan in matched_plan(args.candidate_binary, args.baseline_binary):
+                repeat, arm = plan['repeat'], plan['arm']
+                source = args.candidate_source if arm == 'candidate' else args.baseline_source
+                value = trial(directory / ('trial-'+str(len(summary['trials']))), dict(plan['cell'], repeat=repeat, arm=arm), plan['count'], plan['rate'], binary=plan['binary'], source=source)
+                summary['trials'].append(value)
+                save(directory / 'summary.json', summary)
+                print(json.dumps(dict(repeat=repeat, arm=arm, passed=value['passed'], evidence=str(directory)), flush=True))
+                if value.get('error') or not value['cleanup']['all_exited'] or not value['cleanup']['sampler_stopped'] or value['cleanup']['errors']:
+                    raise RuntimeError(value.get('error', 'cleanup failure'))
+            summary['campaign']['completed'] = len(summary['trials']) == 10
         else:
             matrix = cells()
             for repeat in range(WORKLOAD['repeats']):
