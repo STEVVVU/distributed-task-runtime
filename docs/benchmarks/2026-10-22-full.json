@@ -1,0 +1,74 @@
+{
+  "verdict": "failed",
+  "source_sha": "77f28f26a002f729496d7b2c5a02815132e5eeb3",
+  "curation_head_sha": "3f5af67db23f11683b0ac4c13b623e51ca347319",
+  "summary_sha256": "915a7a9e5878dce39a6a81e81b1fc773bc8d54d6aeb8d4447b7cb111e72856bf",
+  "environment": {
+    "go": "1.27.3",
+    "python": "3.11.17",
+    "platform": "Linux-6.17.0-1022-azure-x86_64-with-glibc2.39",
+    "cores": 4,
+    "cgo_enabled": 0,
+    "gomaxprocs": 2,
+    "gomemlimit": "512MiB",
+    "cpu_model": null,
+    "total_ram_bytes": null,
+    "workers": 2,
+    "topology": "single hosted Linux runner, separate loopback processes"
+  },
+  "workload": {
+    "version": 1,
+    "seed": 421,
+    "axis_trial_dags": 32,
+    "repeats_per_cell": 5,
+    "sweep_seconds": 10,
+    "stability_seconds": 120,
+    "offered_rates_dag_s": [1, 4, 16],
+    "base_cell": {"workers": 2, "root_items": 4096, "parent_delay_ms": 20, "concurrency": 32},
+    "base_input_bytes": 15961,
+    "base_input_sha256": "2804d6361162e3f4d958ffa8ae7aeaea8a19fa3e255bd0396bba96b8dc5a08c6"
+  },
+  "trial_counts": {
+    "total": 51,
+    "passed": 50,
+    "failed": 1,
+    "five_repeat_axis_cells": 45,
+    "offered_rate_runs": 4,
+    "fault_runs": 2
+  },
+  "audit": {
+    "load_samples": 2132,
+    "finished_exact_dags": 2043,
+    "completed_task_proofs": 4086,
+    "failed_outcomes": 0,
+    "rejected": 0,
+    "timed_out": 0,
+    "cleanup_passed": 51,
+    "repeat_groups": 9,
+    "runs_per_repeat_group": 5
+  },
+  "axis_cells_completed_dag_s": [
+    {"workers": 1, "root_items": 4096, "parent_delay_ms": 20, "concurrency": 8, "median": 3.453, "range": [3.388, 3.508]},
+    {"workers": 2, "root_items": 16, "parent_delay_ms": 20, "concurrency": 8, "median": 6.435, "range": [6.267, 6.563]},
+    {"workers": 2, "root_items": 32768, "parent_delay_ms": 20, "concurrency": 8, "median": 3.985, "range": [3.840, 4.122]},
+    {"workers": 2, "root_items": 4096, "parent_delay_ms": 0, "concurrency": 8, "median": 6.353, "range": [6.239, 6.420]},
+    {"workers": 2, "root_items": 4096, "parent_delay_ms": 20, "concurrency": 1, "median": 2.684, "range": [2.676, 2.726]},
+    {"workers": 2, "root_items": 4096, "parent_delay_ms": 20, "concurrency": 32, "median": 5.424, "range": [5.253, 5.475]},
+    {"workers": 2, "root_items": 4096, "parent_delay_ms": 20, "concurrency": 8, "median": 5.971, "range": [5.817, 5.995]},
+    {"workers": 2, "root_items": 4096, "parent_delay_ms": 200, "concurrency": 8, "median": 3.917, "range": [3.809, 3.967]},
+    {"workers": 4, "root_items": 4096, "parent_delay_ms": 20, "concurrency": 8, "median": 7.786, "range": [7.743, 7.927]}
+  ],
+  "rate_runs": [
+    {"offered_dag_s": 1, "seconds": 10, "offered": 10, "finished": 10, "declined": 0, "errors": 0},
+    {"offered_dag_s": 4, "seconds": 10, "offered": 40, "finished": 40, "declined": 0, "errors": 0},
+    {"offered_dag_s": 16, "seconds": 10, "offered": 160, "finished": 71, "declined": 89, "errors": 0, "latency_p99_ms": 14213.985, "scheduler_start_lag_p99_ms": 16.902},
+    {"offered_dag_s": 4, "seconds": 120, "offered": 480, "finished": 480, "declined": 0, "errors": 0, "latency_p50_p95_p99_ms": [519.876, 809.847, 997.806], "scheduler_start_lag_p99_ms": 29.975}
+  ],
+  "fault_runs": [
+    {"fault": "worker-loss", "passed": true, "exact_result": 822, "retried_slow_attempt": 2, "cleanup_passed": true},
+    {"fault": "coordinator-restart", "passed": true, "exact_result": 822, "retried_slow_attempt": 2, "cleanup_passed": true}
+  ],
+  "screening_thresholds_ms": {"scheduler_start_lag_p99": 100, "end_to_end_latency_p99": 5000},
+  "screening_thresholds_are_production_sla": false,
+  "claims_not_supported": ["production capacity", "six-node behavior", "1600 tasks/s", "4.8x speedup", "latency improvement", "RSS improvement", "remote-task-dispatch latency"]
+}
