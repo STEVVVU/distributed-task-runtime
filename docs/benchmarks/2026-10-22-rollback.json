@@ -1,0 +1,46 @@
+{
+  "baseline": {
+    "finished": {
+      "median": 70,
+      "minimum": 68,
+      "maximum": 72
+    },
+    "throughput": {
+      "median": 4.647365761323971,
+      "minimum": 4.620999353743269,
+      "maximum": 4.717598219822432
+    },
+    "p99": {
+      "median": 14213.624635999991,
+      "minimum": 13014.350215000008,
+      "maximum": 15023.104787000022
+    },
+    "binary_sha256": "c6485901a788b5604691b5288f9cce53a3470e056675918cec5935ed2a87e896",
+    "source": "7ed42c3abe0681108ed5ea972138a23db08427d0",
+    "generator_declined_total": 449
+  },
+  "candidate": {
+    "finished": {
+      "median": 73,
+      "minimum": 70,
+      "maximum": 74
+    },
+    "throughput": {
+      "median": 5.010573672124506,
+      "minimum": 4.966511711532012,
+      "maximum": 5.036496045118355
+    },
+    "p99": {
+      "median": 13477.554138999978,
+      "minimum": 12431.526529999985,
+      "maximum": 14417.257638999956
+    },
+    "binary_sha256": "b903b757cb9c64e554881651293d56fffecc60ab982ccdee923960311c2ef733",
+    "source": "77f28f26a002f729496d7b2c5a02815132e5eeb3",
+    "generator_declined_total": 439
+  },
+  "median_throughput_change_percent": 7.815350231806639,
+  "summary_sha256": "7d3a77966f12da3d3385945a19d509d3e3ecefabd505bebce62abd6042a5f0ac",
+  "trials": 10,
+  "all_negative_overload_verdicts_retained": true
+}
