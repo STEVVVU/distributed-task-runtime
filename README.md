@@ -2,6 +2,364 @@
 
 ## Architecture and execution guide
 
+<!-- execution-flow:start -->
+### Execution flow
+
+Start with the primary path, then expand a detailed workflow. Select a numbered node to see its operation, implementation techniques, and source. Solid arrows show the named control, data, or lifecycle handoff; dotted arrows show error paths. Separate entry points are named in each workflow.
+
+<a id="review-walkthrough"></a>
+
+#### Walk through one concrete example
+
+Submit a call to an installed allowlisted Python function with literal arguments, then retrieve its result through the returned ObjectRef.
+
+**Trace.** [Encode literals and future references](#flow-step-client-encode) → [Validate and durably admit task](#flow-step-coordinator-admit) → [Wait for located dependencies](#flow-step-coordinator-ready) → [Choose a local worker and fence attempt](#flow-step-coordinator-locality-assign) → [Run installed allowlisted Python function](#flow-step-worker-child) → [Persist attempt-scoped result](#flow-step-worker-store-result) → [Fence and commit completion](#flow-step-coordinator-accept) → [Locate and fetch ObjectRef](#flow-step-client-locate-fetch).
+
+**Result and boundary.** The client receives an ObjectRef; an eligible worker resolves its dependencies, invokes the installed function in a bounded child, and stores an attempt-scoped result. The coordinator fences and accepts completion before a separate client resolve locates and fetches the value. Unsupported function and value inputs are rejected.
+
+<details>
+<summary>Implementation decisions to explain</summary>
+
+**Why return a future reference and schedule only after its dependencies are located?** References let callers compose dependent tasks without moving result bytes through each caller, and readiness plus locality scoring schedules work where dependencies are already available. The tradeoff is that callers must resolve the reference and account for task failure or deadlines.
+
+[Future reference encoding](#technique-future-reference-encoding) · [DAG dependency extraction and readiness](#technique-dag-dependency-extraction-and-readiness) · [Data-locality scheduling](#technique-data-locality-scheduling).
+
+</details>
+
+#### Primary execution flow
+
+A Python ObjectRef task is admitted as durable coordinator lineage, assigned when inputs are available, executed by a worker and child interpreter, then published under a fenced attempt for later locate/fetch.
+
+```mermaid
+flowchart TD
+    n1["1. Encode literals and future<br/>references"]
+    click n1 href "https://github.com/STEVVVU/distributed-task-runtime#flow-step-client-encode" "Open step, techniques, and source" _top
+    n2["2. Send authenticated protobuf<br/>RPC"]
+    click n2 href "https://github.com/STEVVVU/distributed-task-runtime#flow-step-client-rpc" "Open step, techniques, and source" _top
+    n3["3. Validate and durably admit<br/>task"]
+    click n3 href "https://github.com/STEVVVU/distributed-task-runtime#flow-step-coordinator-admit" "Open step, techniques, and source" _top
+    n4["4. Wait for located dependencies"]
+    click n4 href "https://github.com/STEVVVU/distributed-task-runtime#flow-step-coordinator-ready" "Open step, techniques, and source" _top
+    n5["5. Choose a local worker and<br/>fence attempt"]
+    click n5 href "https://github.com/STEVVVU/distributed-task-runtime#flow-step-coordinator-locality-assign" "Open step, techniques, and source" _top
+    n6["6. Load dependencies locally or<br/>from peers"]
+    click n6 href "https://github.com/STEVVVU/distributed-task-runtime#flow-step-worker-fetch" "Open step, techniques, and source" _top
+    n7["7. Run installed allowlisted<br/>Python function"]
+    click n7 href "https://github.com/STEVVVU/distributed-task-runtime#flow-step-worker-child" "Open step, techniques, and source" _top
+    n8["8. Persist attempt-scoped result"]
+    click n8 href "https://github.com/STEVVVU/distributed-task-runtime#flow-step-worker-store-result" "Open step, techniques, and source" _top
+    n9["9. Fence and commit completion"]
+    click n9 href "https://github.com/STEVVVU/distributed-task-runtime#flow-step-coordinator-accept" "Open step, techniques, and source" _top
+    n13["13. Locate and fetch ObjectRef"]
+    click n13 href "https://github.com/STEVVVU/distributed-task-runtime#flow-step-client-locate-fetch" "Open step, techniques, and source" _top
+    n1 -->|"submit request"| n2
+    n2 -->|"authenticated Call"| n3
+    n3 -->|"saved queued task"| n4
+    n4 -->|"all dependencies located; idle workers"| n5
+    n5 -->|"assignment with root/location specs"| n6
+    n6 -->|"resolved argument values"| n7
+    n7 -->|"valid JSON result"| n8
+    n8 -->|"completion after local store"| n9
+    n9 -->|"done location committed"| n13
+```
+
+**Detailed workflows.** [Submit, execute, and retrieve a future](#flow-workflow-task-submit-execute-result) · [Worker loss, lease expiry, restart, and completion replay](#flow-workflow-leases-restart-and-replay) · [Execution failures and observable correctness oracles](#flow-workflow-failure-and-oracle-paths) · [Role startup and gRPC trust boundary](#flow-workflow-protocol-startup-boundary).
+
+<a id="flow-workflow-task-submit-execute-result"></a>
+
+<details>
+<summary>Submit, execute, and retrieve a future</summary>
+
+Python API entrypoint from Remote.remote through authenticated gRPC, coordinator scheduling, worker result storage and Runtime.get. Runtime.get is a later client call, not a continuation in the worker process.
+
+```mermaid
+flowchart TD
+    n1["1. Encode literals and future<br/>references"]
+    click n1 href "https://github.com/STEVVVU/distributed-task-runtime#flow-step-client-encode" "Open step, techniques, and source" _top
+    n2["2. Send authenticated protobuf<br/>RPC"]
+    click n2 href "https://github.com/STEVVVU/distributed-task-runtime#flow-step-client-rpc" "Open step, techniques, and source" _top
+    n3["3. Validate and durably admit<br/>task"]
+    click n3 href "https://github.com/STEVVVU/distributed-task-runtime#flow-step-coordinator-admit" "Open step, techniques, and source" _top
+    n4["4. Wait for located dependencies"]
+    click n4 href "https://github.com/STEVVVU/distributed-task-runtime#flow-step-coordinator-ready" "Open step, techniques, and source" _top
+    n5["5. Choose a local worker and<br/>fence attempt"]
+    click n5 href "https://github.com/STEVVVU/distributed-task-runtime#flow-step-coordinator-locality-assign" "Open step, techniques, and source" _top
+    n6["6. Load dependencies locally or<br/>from peers"]
+    click n6 href "https://github.com/STEVVVU/distributed-task-runtime#flow-step-worker-fetch" "Open step, techniques, and source" _top
+    n7["7. Run installed allowlisted<br/>Python function"]
+    click n7 href "https://github.com/STEVVVU/distributed-task-runtime#flow-step-worker-child" "Open step, techniques, and source" _top
+    n8["8. Persist attempt-scoped result"]
+    click n8 href "https://github.com/STEVVVU/distributed-task-runtime#flow-step-worker-store-result" "Open step, techniques, and source" _top
+    n9["9. Fence and commit completion"]
+    click n9 href "https://github.com/STEVVVU/distributed-task-runtime#flow-step-coordinator-accept" "Open step, techniques, and source" _top
+    n13["13. Locate and fetch ObjectRef"]
+    click n13 href "https://github.com/STEVVVU/distributed-task-runtime#flow-step-client-locate-fetch" "Open step, techniques, and source" _top
+    n1 -->|"submit request"| n2
+    n2 -->|"authenticated Call"| n3
+    n3 -->|"saved queued task"| n4
+    n4 -->|"all dependencies located; idle workers"| n5
+    n5 -->|"assignment with root/location specs"| n6
+    n6 -->|"resolved argument values"| n7
+    n7 -->|"valid JSON result"| n8
+    n8 -->|"completion after local store"| n9
+    n9 -->|"done location committed"| n13
+```
+
+</details>
+
+<a id="flow-workflow-leases-restart-and-replay"></a>
+
+<details>
+<summary>Worker loss, lease expiry, restart, and completion replay</summary>
+
+Independent worker heartbeat and coordinator ticker paths mutate the shared task state. Restart recovers persisted running tasks; worker completion retries replay the same request after uncertain RPC outcomes.
+
+```mermaid
+flowchart TD
+    n14["14. Register and refresh worker<br/>lease"]
+    click n14 href "https://github.com/STEVVVU/distributed-task-runtime#flow-step-worker-heartbeat" "Open step, techniques, and source" _top
+    n11["11. Expire leases and retry or<br/>fail"]
+    click n11 href "https://github.com/STEVVVU/distributed-task-runtime#flow-step-lease-expire-retry" "Open step, techniques, and source" _top
+    n12["12. Recover running tasks on<br/>coordinator restart"]
+    click n12 href "https://github.com/STEVVVU/distributed-task-runtime#flow-step-coordinator-restart" "Open step, techniques, and source" _top
+    n10["10. Replay completion after<br/>uncertain response"]
+    click n10 href "https://github.com/STEVVVU/distributed-task-runtime#flow-step-worker-replay-completion" "Open step, techniques, and source" _top
+    n14 -->|"heartbeat timestamp is aged by<br/>coordinator ticker"| n11
+```
+
+</details>
+
+<a id="flow-workflow-failure-and-oracle-paths"></a>
+
+<details>
+<summary>Execution failures and observable correctness oracles</summary>
+
+Failures flow through retryable input errors, terminal errors, lease and deadline expiry, stale completion rejection, and boundary validation; listed tests assert these behaviors without representing production stages.
+
+```mermaid
+flowchart TD
+    n4["4. Wait for located dependencies"]
+    click n4 href "https://github.com/STEVVVU/distributed-task-runtime#flow-step-coordinator-ready" "Open step, techniques, and source" _top
+    n6["6. Load dependencies locally or<br/>from peers"]
+    click n6 href "https://github.com/STEVVVU/distributed-task-runtime#flow-step-worker-fetch" "Open step, techniques, and source" _top
+    n7["7. Run installed allowlisted<br/>Python function"]
+    click n7 href "https://github.com/STEVVVU/distributed-task-runtime#flow-step-worker-child" "Open step, techniques, and source" _top
+    n8["8. Persist attempt-scoped result"]
+    click n8 href "https://github.com/STEVVVU/distributed-task-runtime#flow-step-worker-store-result" "Open step, techniques, and source" _top
+    n9["9. Fence and commit completion"]
+    click n9 href "https://github.com/STEVVVU/distributed-task-runtime#flow-step-coordinator-accept" "Open step, techniques, and source" _top
+    n11["11. Expire leases and retry or<br/>fail"]
+    click n11 href "https://github.com/STEVVVU/distributed-task-runtime#flow-step-lease-expire-retry" "Open step, techniques, and source" _top
+    n13["13. Locate and fetch ObjectRef"]
+    click n13 href "https://github.com/STEVVVU/distributed-task-runtime#flow-step-client-locate-fetch" "Open step, techniques, and source" _top
+    n15["15. Assert fencing, recovery,<br/>and validation outcomes"]
+    click n15 href "https://github.com/STEVVVU/distributed-task-runtime#flow-step-oracle-recovery-tests" "Open step, techniques, and source" _top
+    n6 -.->|"input unavailable; retry flag set"| n9
+    n7 -.->|"child or execution error"| n9
+    n11 -->|"attempt budget remains; task queued"| n4
+    n9 -.->|"failed task state"| n13
+    n4 -->|"assert dependency and retry behavior"| n15
+    n9 -->|"assert accepted state and stale<br/>fencing"| n15
+    n13 -->|"assert client deadline boundary"| n15
+```
+
+</details>
+
+<a id="flow-workflow-protocol-startup-boundary"></a>
+
+<details>
+<summary>Role startup and gRPC trust boundary</summary>
+
+The shared gRPC validation constrains each RPC. Worker.Run independently sends heartbeats to the coordinator; Worker.Call exposes fetch only. Process role selection starts these paths without a client-RPC-to-heartbeat handoff.
+
+```mermaid
+flowchart TD
+    n2["2. Send authenticated protobuf<br/>RPC"]
+    click n2 href "https://github.com/STEVVVU/distributed-task-runtime#flow-step-client-rpc" "Open step, techniques, and source" _top
+    n14["14. Register and refresh worker<br/>lease"]
+    click n14 href "https://github.com/STEVVVU/distributed-task-runtime#flow-step-worker-heartbeat" "Open step, techniques, and source" _top
+```
+
+</details>
+
+#### Steps, techniques, and source
+
+These source traces cover the active scope below. They explain implementation behavior; benchmark results and their limits remain in the measurement sections.
+
+<a id="flow-step-client-encode"></a>
+
+##### 1. Encode literals and future references
+
+**Component.** taskruntime.client.encode / Remote.remote. Remote.remote validates the installed top-level function signature, recursively encodes literals, containers and ObjectRefs, submits the task, then returns its ID as an ObjectRef. Client validation rejects unsupported values, excessive nesting and non-finite or inexact numbers.
+
+**Techniques at this step.** [Future reference encoding](#technique-future-reference-encoding) · [JSON and protobuf conversion with size checks](#technique-bounded-json-and-protobuf-boundary).
+
+**Source.** [`taskruntime/client.py:57`](https://github.com/STEVVVU/distributed-task-runtime/blob/main/taskruntime/client.py#L57) · [`taskruntime/client.py:78`](https://github.com/STEVVVU/distributed-task-runtime/blob/main/taskruntime/client.py#L78) · [`taskruntime/client.py:16`](https://github.com/STEVVVU/distributed-task-runtime/blob/main/taskruntime/client.py#L16). [Back to execution flow](#execution-flow).
+
+<a id="flow-step-client-rpc"></a>
+
+##### 2. Send authenticated protobuf RPC
+
+**Component.** taskruntime.client.rpc / internal.wire. The client accepts only loopback IP endpoints, converts request maps through protobuf Struct, sets 2 MiB send/receive limits, and sends the capability in authorization metadata. The server requires exactly one constant-time matching token and rejects non-finite Struct values before handler conversion.
+
+**Techniques at this step.** [Loopback capability authentication](#technique-loopback-capability-authentication) · [JSON and protobuf conversion with size checks](#technique-bounded-json-and-protobuf-boundary).
+
+**Source.** [`taskruntime/client.py:36`](https://github.com/STEVVVU/distributed-task-runtime/blob/main/taskruntime/client.py#L36) · [`internal/wire/wire.go:101`](https://github.com/STEVVVU/distributed-task-runtime/blob/main/internal/wire/wire.go#L101) · [`internal/wire/wire.go:42`](https://github.com/STEVVVU/distributed-task-runtime/blob/main/internal/wire/wire.go#L42) · [`protocol/runtime.proto:7`](https://github.com/STEVVVU/distributed-task-runtime/blob/main/protocol/runtime.proto#L7). [Back to execution flow](#execution-flow).
+
+<a id="flow-step-coordinator-admit"></a>
+
+##### 3. Validate and durably admit task
+
+**Component.** cluster.Coordinator.handle / Call. Submit checks task/module/function identifiers, serialized size, recursive argument shape and references, known dependencies, dependency count, root input budget, ID conflicts and assignment protobuf budget. It records queued task lineage and an empty result object only after the response fits and bbolt save succeeds; failed commits restore the last committed snapshot and return an error.
+
+**Techniques at this step.** [DAG dependency extraction and readiness](#technique-dag-dependency-extraction-and-readiness) · [JSON and protobuf conversion with size checks](#technique-bounded-json-and-protobuf-boundary) · [Durable commit before acknowledgement](#technique-durable-commit-before-acknowledgement) · [Committed snapshot rollback](#technique-committed-snapshot-rollback).
+
+**Source.** [`internal/cluster/model.go:84`](https://github.com/STEVVVU/distributed-task-runtime/blob/main/internal/cluster/model.go#L84) · [`internal/cluster/coordinator.go:167`](https://github.com/STEVVVU/distributed-task-runtime/blob/main/internal/cluster/coordinator.go#L167) · [`internal/cluster/coordinator.go:141`](https://github.com/STEVVVU/distributed-task-runtime/blob/main/internal/cluster/coordinator.go#L141). [Back to execution flow](#execution-flow).
+
+<a id="flow-step-coordinator-ready"></a>
+
+##### 4. Wait for located dependencies
+
+**Component.** cluster.Coordinator.handle poll. Workers must be registered and idle. Poll scans queued tasks in sorted ID order; a failed parent marks its child failed, while any dependency with neither root bytes nor a location keeps the task queued.
+
+**Techniques at this step.** [DAG dependency extraction and readiness](#technique-dag-dependency-extraction-and-readiness).
+
+**Source.** [`internal/cluster/coordinator.go:167`](https://github.com/STEVVVU/distributed-task-runtime/blob/main/internal/cluster/coordinator.go#L167). [Back to execution flow](#execution-flow).
+
+<a id="flow-step-coordinator-locality-assign"></a>
+
+##### 5. Choose a local worker and fence attempt
+
+**Component.** cluster.Coordinator.handle poll. Among idle workers, the coordinator scores the count of dependencies already located on each worker and breaks ties by worker ID. The selected worker receives incremented attempt metadata and dependency root/location specs; the node becomes busy and the task running.
+
+**Techniques at this step.** [Data-locality scheduling](#technique-data-locality-scheduling) · [Attempt fencing and bounded retries](#technique-attempt-fencing-and-bounded-retries).
+
+**Source.** [`internal/cluster/coordinator.go:167`](https://github.com/STEVVVU/distributed-task-runtime/blob/main/internal/cluster/coordinator.go#L167). [Back to execution flow](#execution-flow).
+
+<a id="flow-step-worker-fetch"></a>
+
+##### 6. Load dependencies locally or from peers
+
+**Component.** cluster.Worker.execute / load / Call. For each assigned input, the worker reads its bbolt object store; root bytes are stored locally when absent. For computed values it tries advertised locations via authenticated fetch RPC, caches fetched bytes locally, counts transfers and returns an input error if no location works.
+
+**Techniques at this step.** [Persistent local objects and peer fetch](#technique-persistent-local-objects-and-peer-fetch) · [Layered execution deadlines and output budgets](#technique-layered-execution-deadlines-and-output-budgets).
+
+**Source.** [`internal/cluster/worker.go:30`](https://github.com/STEVVVU/distributed-task-runtime/blob/main/internal/cluster/worker.go#L30) · [`internal/cluster/worker.go:42`](https://github.com/STEVVVU/distributed-task-runtime/blob/main/internal/cluster/worker.go#L42) · [`internal/cluster/worker.go:108`](https://github.com/STEVVVU/distributed-task-runtime/blob/main/internal/cluster/worker.go#L108). [Back to execution flow](#execution-flow).
+
+<a id="flow-step-worker-child"></a>
+
+##### 7. Run installed allowlisted Python function
+
+**Component.** cluster.Worker.execute / taskruntime.worker_exec.main. The worker resolves reference arguments and starts one Python module invocation with an 8-second child context inside a 10-second execution context. The child checks the operator module allowlist, requires a top-level function from that module, binds arguments, redirects task stdout to stderr, validates JSON output and caps result/error bytes; command failures and deadline expiry become completion errors.
+
+**Techniques at this step.** [Trusted installed-function subprocess](#technique-trusted-installed-function-subprocess) · [Layered execution deadlines and output budgets](#technique-layered-execution-deadlines-and-output-budgets).
+
+**Source.** [`internal/cluster/worker.go:108`](https://github.com/STEVVVU/distributed-task-runtime/blob/main/internal/cluster/worker.go#L108) · [`taskruntime/worker_exec.py:11`](https://github.com/STEVVVU/distributed-task-runtime/blob/main/taskruntime/worker_exec.py#L11). [Back to execution flow](#execution-flow).
+
+<a id="flow-step-worker-store-result"></a>
+
+##### 8. Persist attempt-scoped result
+
+**Component.** cluster.Worker.execute / store. A successful child result is stored in worker bbolt under a task-and-attempt key after JSON/object size validation. A failed store is surfaced as task execution failure, so no successful completion is sent for an unpublished result.
+
+**Techniques at this step.** [Persistent local objects and peer fetch](#technique-persistent-local-objects-and-peer-fetch) · [Durable commit before acknowledgement](#technique-durable-commit-before-acknowledgement) · [Layered execution deadlines and output budgets](#technique-layered-execution-deadlines-and-output-budgets).
+
+**Source.** [`internal/cluster/worker.go:108`](https://github.com/STEVVVU/distributed-task-runtime/blob/main/internal/cluster/worker.go#L108) · [`internal/cluster/worker.go:42`](https://github.com/STEVVVU/distributed-task-runtime/blob/main/internal/cluster/worker.go#L42). [Back to execution flow](#execution-flow).
+
+<a id="flow-step-coordinator-accept"></a>
+
+##### 9. Fence and commit completion
+
+**Component.** cluster.Coordinator.handle complete / Call. Completion is accepted only for the current task attempt and worker session while running; stale attempts are rejected. The coordinator releases the worker, updates counters, records either failure/retry or the worker address and attempt-scoped object key, then commits state before replying; failed persistence rolls back to the last committed snapshot.
+
+**Techniques at this step.** [Attempt fencing and bounded retries](#technique-attempt-fencing-and-bounded-retries) · [Durable commit before acknowledgement](#technique-durable-commit-before-acknowledgement) · [Committed snapshot rollback](#technique-committed-snapshot-rollback).
+
+**Source.** [`internal/cluster/coordinator.go:167`](https://github.com/STEVVVU/distributed-task-runtime/blob/main/internal/cluster/coordinator.go#L167) · [`internal/cluster/coordinator.go:141`](https://github.com/STEVVVU/distributed-task-runtime/blob/main/internal/cluster/coordinator.go#L141). [Back to execution flow](#execution-flow).
+
+<a id="flow-step-worker-replay-completion"></a>
+
+##### 10. Replay completion after uncertain response
+
+**Component.** cluster.Worker.Run. The worker retries the same completion request at most 20 times with 200 ms waits when the RPC outcome is uncertain. It stops on success or stale-attempt response; context cancellation ends the loop and worker run.
+
+**Techniques at this step.** [Attempt fencing and bounded retries](#technique-attempt-fencing-and-bounded-retries).
+
+**Source.** [`internal/cluster/worker.go:62`](https://github.com/STEVVVU/distributed-task-runtime/blob/main/internal/cluster/worker.go#L62). [Back to execution flow](#execution-flow).
+
+<a id="flow-step-lease-expire-retry"></a>
+
+##### 11. Expire leases and retry or fail
+
+**Component.** cluster.Coordinator.expire / Run. The coordinator removes workers missing heartbeats for over 2 seconds, removes their object locations and retries their running tasks. Running tasks older than 15 seconds are retried; queued tasks older than 60 seconds fail. Retry clears ownership and queues while under MaxAttempts, otherwise records terminal failure; periodic state-save failure restores the last committed snapshot.
+
+**Techniques at this step.** [Worker heartbeat and lease expiry](#technique-worker-heartbeat-and-lease-expiry) · [Attempt fencing and bounded retries](#technique-attempt-fencing-and-bounded-retries) · [Layered execution deadlines and output budgets](#technique-layered-execution-deadlines-and-output-budgets) · [Committed snapshot rollback](#technique-committed-snapshot-rollback).
+
+**Source.** [`internal/cluster/coordinator.go:89`](https://github.com/STEVVVU/distributed-task-runtime/blob/main/internal/cluster/coordinator.go#L89) · [`internal/cluster/coordinator.go:79`](https://github.com/STEVVVU/distributed-task-runtime/blob/main/internal/cluster/coordinator.go#L79) · [`internal/cluster/coordinator.go:122`](https://github.com/STEVVVU/distributed-task-runtime/blob/main/internal/cluster/coordinator.go#L122). [Back to execution flow](#execution-flow).
+
+<a id="flow-step-coordinator-restart"></a>
+
+##### 12. Recover running tasks on coordinator restart
+
+**Component.** cluster.OpenCoordinator. Startup reloads persisted state, refreshes node heartbeat timestamps, clears node busy markers, and sends previously running tasks through bounded retry before saving the recovered snapshot. The old assignment is fenced by the incremented attempt when a worker polls again.
+
+**Techniques at this step.** [Committed snapshot rollback](#technique-committed-snapshot-rollback) · [Attempt fencing and bounded retries](#technique-attempt-fencing-and-bounded-retries).
+
+**Source.** [`internal/cluster/coordinator.go:24`](https://github.com/STEVVVU/distributed-task-runtime/blob/main/internal/cluster/coordinator.go#L24). [Back to execution flow](#execution-flow).
+
+<a id="flow-step-client-locate-fetch"></a>
+
+##### 13. Locate and fetch ObjectRef
+
+**Component.** taskruntime.client.Runtime.get. get polls locate until its monotonic deadline, returning root values directly, raising TaskError for failed tasks, or fetching a done result from an advertised worker location. Unavailable/deadline RPCs and fetch errors update the last error; other gRPC statuses propagate immediately, and expiry raises TimeoutError.
+
+**Techniques at this step.** [Deadline-bounded polling](#technique-deadline-bounded-polling) · [Layered execution deadlines and output budgets](#technique-layered-execution-deadlines-and-output-budgets) · [Persistent local objects and peer fetch](#technique-persistent-local-objects-and-peer-fetch).
+
+**Source.** [`taskruntime/client.py:103`](https://github.com/STEVVVU/distributed-task-runtime/blob/main/taskruntime/client.py#L103). [Back to execution flow](#execution-flow).
+
+<a id="flow-step-worker-heartbeat"></a>
+
+##### 14. Register and refresh worker lease
+
+**Component.** cluster.Worker.Run / Coordinator.handle heartbeat. A worker goroutine sends heartbeat with its ID and address before waiting on a 300 ms ticker or context cancellation. Coordinator validates worker ID and loopback address, creates or refreshes the node timestamp, and rejects address changes for an existing session.
+
+**Techniques at this step.** [Worker heartbeat and lease expiry](#technique-worker-heartbeat-and-lease-expiry) · [Loopback capability authentication](#technique-loopback-capability-authentication).
+
+**Source.** [`internal/cluster/worker.go:62`](https://github.com/STEVVVU/distributed-task-runtime/blob/main/internal/cluster/worker.go#L62) · [`internal/cluster/coordinator.go:167`](https://github.com/STEVVVU/distributed-task-runtime/blob/main/internal/cluster/coordinator.go#L167). [Back to execution flow](#execution-flow).
+
+<a id="flow-step-oracle-recovery-tests"></a>
+
+##### 15. Assert fencing, recovery, and validation outcomes
+
+**Component.** coordinator_test.go / wire_test.go / test_client.py. Tests assert restart requeues and fences old assignments, durable roots/results survive reopening, retries cap and dependency failures propagate, worker loss invalidates locations, failed commits do not publish, wire service stops on owned context, and client encoding/deadline boundaries behave as expected. These are test oracles, not production runtime stages.
+
+**Techniques at this step.** [DAG, recovery, and failure assertions](#technique-dag-recovery-and-failure-assertions).
+
+**Source.** [`internal/cluster/coordinator_test.go:44`](https://github.com/STEVVVU/distributed-task-runtime/blob/main/internal/cluster/coordinator_test.go#L44) · [`internal/wire/wire_test.go:14`](https://github.com/STEVVVU/distributed-task-runtime/blob/main/internal/wire/wire_test.go#L14) · [`tests/test_client.py:8`](https://github.com/STEVVVU/distributed-task-runtime/blob/main/tests/test_client.py#L8). [Back to execution flow](#execution-flow).
+
+<details>
+<summary>Scope and subsystem coverage</summary>
+
+Python task submission and result lookup; coordinator admission, dependency readiness, locality, attempts, leases and durable state; worker object fetch, allowlisted child execution and completion; gRPC trust and message boundaries; source-backed correctness oracles.
+
+- **Client futures and DAG construction.** Future references are encoded by client; coordinator extracts dependencies and gates readiness; get polls/fetches the result. [Step 1](#flow-step-client-encode), [Step 3](#flow-step-coordinator-admit), [Step 4](#flow-step-coordinator-ready), [Step 13](#flow-step-client-locate-fetch).
+- **Coordinator scheduling and recovery.** Admission, readiness, locality assignment, attempt fencing, leases, retries, restart recovery and durable publication are represented. [Step 3](#flow-step-coordinator-admit), [Step 4](#flow-step-coordinator-ready), [Step 5](#flow-step-coordinator-locality-assign), [Step 9](#flow-step-coordinator-accept), [Step 11](#flow-step-lease-expire-retry), [Step 12](#flow-step-coordinator-restart), [Step 14](#flow-step-worker-heartbeat), [Step 10](#flow-step-worker-replay-completion).
+- **Worker execution and object data path.** Local bbolt access, peer fetch/cache, child invocation, execution deadlines and attempt-key result persistence are represented. [Step 6](#flow-step-worker-fetch), [Step 7](#flow-step-worker-child), [Step 8](#flow-step-worker-store-result).
+- **gRPC protocol and trust boundary.** The authenticated loopback Struct RPC boundary, finite value checks and process role startup are represented. [Step 2](#flow-step-client-rpc), [Step 14](#flow-step-worker-heartbeat).
+- **Observable correctness oracles.** Tests are marked as verification-only assertions, including coordinator durability/fencing, wire shutdown and client boundary behavior. [Step 15](#flow-step-oracle-recovery-tests).
+
+Outside this flow audit:
+
+- `examples/`. Installed example functions are task payloads, not runtime mechanisms.
+- `cmd/runtime/benchmark_profile*.go`. Optional profiling instrumentation does not implement task execution or recovery.
+- `docs/benchmarks/`. Benchmark reports describe prior runs, not active implementation techniques.
+
+</details>
+
+<!-- execution-flow:end -->
+
+<details>
+<summary>Subsystem technique index</summary>
+
 ### Subsystem map
 
 Select a subsystem in the diagram to open its techniques, tradeoffs, and code references. The numbered links provide the same navigation. This map groups components; the execution diagrams show their runtime flow.
@@ -30,6 +388,8 @@ flowchart LR
 This repository implements a teaching distributed-futures runtime: a Python client, Go coordinator, Go workers, and child Python interpreters for allowlisted installed functions. It uses gRPC and protobuf libraries; it does not implement a replicated coordinator, hostile-code sandbox, or exactly-once side effects. An [ObjectRef](#object-ref) names a root value or task result.
 
 The client submits task definitions and [ObjectRefs](#object-ref) to the coordinator as a [task DAG](#task-dag). Workers fetch dependencies from local or peer [object locations](#object-location), invoke a [trusted function](#trusted-function), commit output locally, then announce the accepted attempt. The coordinator makes metadata [durable before response](#durable-before-response) and uses [attempt fencing](#attempt-fencing).
+
+</details>
 
 <details>
 <summary>Expand flow diagram 1</summary>
