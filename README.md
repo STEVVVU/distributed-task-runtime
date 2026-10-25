@@ -2,6 +2,7 @@
 
 ## Guide
 
+- [Implementation techniques](#implementation-techniques)
 - [Architecture and execution guide](#architecture-and-execution-guide)
 - [Run the verified cluster](#run-the-verified-cluster)
 - [How it works](#how-it-works)
@@ -226,5 +227,255 @@ It means task metadata is written to bbolt before submission or accepted complet
 <details><summary>What is a trusted function?</summary>
 
 It is an installed top-level function in a module operators allowlist on workers. Clients cannot upload source or request arbitrary imports.
+
+</details>
+
+## Implementation techniques
+
+This section covers active client, coordinator, worker, persistence, subprocess, protocol, and authentication paths; rationale is inferred from current code.
+
+| Active subsystem | Technique cards | Source files |
+|---|---|---|
+| Client futures and DAG construction | [Future reference encoding](#technique-future-reference-encoding), [DAG dependency extraction and readiness](#technique-dag-dependency-extraction-and-readiness), [JSON and protobuf conversion with size checks](#technique-bounded-json-and-protobuf-boundary), [Deadline-bounded polling](#technique-deadline-bounded-polling) | `taskruntime/client.py`, `internal/cluster/model.go` |
+| Coordinator scheduling and recovery | [Data-locality scheduling](#technique-data-locality-scheduling), [Durable commit before acknowledgement](#technique-durable-commit-before-acknowledgement), [Attempt fencing and bounded retries](#technique-attempt-fencing-and-bounded-retries), [Worker heartbeat and lease expiry](#technique-worker-heartbeat-and-lease-expiry), [Committed snapshot rollback](#technique-committed-snapshot-rollback) | `internal/cluster/coordinator.go`, `internal/cluster/model.go` |
+| Worker execution and object data path | [Persistent local objects and peer fetch](#technique-persistent-local-objects-and-peer-fetch), [Trusted installed-function subprocess](#technique-trusted-installed-function-subprocess), [Layered execution deadlines and output budgets](#technique-layered-execution-deadlines-and-output-budgets) | `internal/cluster/worker.go`, `taskruntime/worker_exec.py` |
+| gRPC protocol and trust boundary | [JSON and protobuf conversion with size checks](#technique-bounded-json-and-protobuf-boundary), [Loopback capability authentication](#technique-loopback-capability-authentication) | `internal/wire/wire.go`, `protocol/runtime.proto`, `cmd/runtime/main.go` |
+| Observable correctness oracles | [DAG, recovery, and failure assertions](#technique-dag-recovery-and-failure-assertions) | `internal/cluster/coordinator_test.go`, `internal/wire/wire_test.go`, `tests/test_client.py` |
+
+<a id="technique-future-reference-encoding"></a>
+
+<details>
+<summary>Future reference encoding</summary>
+
+**Mechanism.** `ObjectRef` carries an ID rather than a value. `encode` recursively converts references nested in lists and dictionaries to tagged argument records; `Remote.remote` submits the function name and those records, then returns the reference without waiting for execution.
+
+**Example.** `remote(total).remote([left, right])` sends a list argument containing two reference tags and returns a new `ObjectRef`.
+
+**Why here.** Callers can describe branching and joined computations with ordinary Python containers while results remain distributed.
+
+**Tradeoffs.** References name runtime objects; they do not make arbitrary Python values serializable. The wire representation also imposes nesting and dependency limits.
+
+**Code and ownership.** [`ObjectRef`, `encode`, and `Remote.remote`](taskruntime/client.py#L48), extension.
+
+</details>
+
+<a id="technique-dag-dependency-extraction-and-readiness"></a>
+
+<details>
+<summary>DAG dependency extraction and readiness</summary>
+
+**Mechanism.** `dependencies` recursively visits tagged arguments and collects reference IDs from nested lists and dictionaries. Submission checks that every ID exists, sorts the unique parents, then polling waits until each root or computed parent has an available location. Requiring existing references prevents forward edges and cycles.
+
+**Example.** A task with `{"values": [refA, refB]}` records both parents; it becomes ready only when both root bytes or accepted locations are available.
+
+**Why here.** The coordinator can make readiness decisions from explicit lineage and object-location metadata.
+
+**Tradeoffs.** This only models references in the supported JSON-shaped argument tree. Nesting and dependency counts are bounded, and failed parents propagate failure to dependents.
+
+**Code and ownership.** [`dependencies`](internal/cluster/model.go#L84) and submission/readiness in [`handle`](internal/cluster/coordinator.go#L167), extension.
+
+</details>
+
+<a id="technique-data-locality-scheduling"></a>
+
+<details>
+<summary>Data-locality scheduling</summary>
+
+**Mechanism.** Polling considers queued tasks whose dependencies are available, then scores idle workers by how many computed dependency objects they already own. The highest score wins; worker ID breaks ties. Root inputs travel in the assignment and are cached locally, while computed objects can be fetched from peers.
+
+**Example.** If worker A has two of a task's three computed inputs and worker B has none, A is selected; it fetches only the missing value.
+
+**Why here.** Computed payloads move directly between worker stores, so placement near dependencies can reduce some peer fetches.
+
+**Tradeoffs.** The score uses accepted ownership metadata, not opportunistic cache copies or worker capacity. It is a heuristic and makes no speedup guarantee.
+
+**Code and ownership.** Worker selection in [`Coordinator.handle`](internal/cluster/coordinator.go#L167), extension.
+
+</details>
+
+<a id="technique-durable-commit-before-acknowledgement"></a>
+
+<details>
+<summary>Durable commit before acknowledgement</summary>
+
+**Mechanism.** Coordinator calls mutate the in-memory state, serialize the reply and enforce its protobuf budget, then save the state in one bbolt update before returning success. A failed validation, encoding, size check, or commit restores the last committed state. Worker output bytes are stored locally before the worker reports completion; accepted locations are committed with coordinator state.
+
+**Example.** `put` returns an ID only after its root value is durable; a task result is not discoverable until its owner has stored the bytes and the coordinator accepts completion.
+
+**Why here.** Acknowledged metadata does not point to a root or output that failed to commit locally.
+
+**Tradeoffs.** The coordinator database is a single durable copy, not replicated consensus state. Worker store loss can make computed values unavailable and trigger bounded reconstruction attempts.
+
+**Code and ownership.** [`Coordinator.Call` and `save`](internal/cluster/coordinator.go#L68), with output persistence in [`Worker.store`](internal/cluster/worker.go#L42), extension.
+
+</details>
+
+<a id="technique-attempt-fencing-and-bounded-retries"></a>
+
+<details>
+<summary>Attempt fencing and bounded retries</summary>
+
+**Mechanism.** Each assignment increments and persists the task attempt and binds it to a worker session. Completion must match task ID, attempt and current session; stale attempts are rejected. Worker completion requests replay the same completion after uncertain responses, and coordinator restart requeues running work with an incremented attempt on reassignment. Retries stop at three attempts.
+
+**Example.** If attempt 1 finishes after restart has queued the task and attempt 2 is assigned, completion from attempt 1 cannot publish its location.
+
+**Why here.** Worker or coordinator failures can leave an earlier execution running while replacement work begins.
+
+**Tradeoffs.** Execution may happen more than once, so side effects can repeat. Fencing controls publication, not execution, and does not promise exactly-once external effects.
+
+**Code and ownership.** [`Coordinator.retry` and completion handling](internal/cluster/coordinator.go#L79), plus completion replay in [`Worker.Run`](internal/cluster/worker.go#L62), extension.
+
+</details>
+
+<a id="technique-worker-heartbeat-and-lease-expiry"></a>
+
+<details>
+<summary>Worker heartbeat and lease expiry</summary>
+
+**Mechanism.** A worker sends heartbeats every 300 ms while polling for tasks. Coordinator expiration removes sessions silent for two seconds, clears their object locations and retries their running work. Running assignments also have a 15-second lease; queued lineage expires after 60 seconds.
+
+**Example.** If a worker stops heartbeating, its accepted locations are invalidated and downstream work waits for reconstructed outputs or fails within its retry/deadline bounds.
+
+**Why here.** These timers let the coordinator detect process loss and bound how long abandoned work remains eligible.
+
+**Tradeoffs.** Heartbeats are liveness evidence, not proof that a worker's task is progressing. Timeout-based recovery can overlap execution, so attempt fencing remains necessary.
+
+**Code and ownership.** [`Worker.Run`](internal/cluster/worker.go#L62) and [`Coordinator.expire`](internal/cluster/coordinator.go#L89), extension.
+
+</details>
+
+<a id="technique-committed-snapshot-rollback"></a>
+
+<details>
+<summary>Committed snapshot rollback</summary>
+
+**Mechanism.** After each successful bbolt save, the coordinator retains the exact serialized state bytes in `committed`. If a later state save fails, it unmarshals that snapshot rather than serializing the previous state again. The periodic expiration loop uses the same snapshot on commit failure.
+
+**Example.** A closed database makes a new `put` fail; the coordinator restores the prior committed map and the failed object remains absent.
+
+**Why here.** This is the implemented response to duplicate state serialization on rollback paths while retaining durable-before-response behavior.
+
+**Tradeoffs.** The snapshot is a second in-memory copy of serialized metadata and is replaced on every successful commit. It does not reduce the normal commit's marshal or database write.
+
+**Code and ownership.** [`Coordinator.save`, `Call`, and `Run`](internal/cluster/coordinator.go#L68), extension.
+
+</details>
+
+<a id="technique-persistent-local-objects-and-peer-fetch"></a>
+
+<details>
+<summary>Persistent local objects and peer fetch</summary>
+
+**Mechanism.** Each worker stores root inputs and computed attempt outputs in its local bbolt object bucket. Execution first checks its local key, then caches assigned root bytes, or tries the listed peer locations until a computed dependency fetch succeeds. Only successful peer fetches increment the transfer count. Clients locate accepted results through the coordinator and fetch bytes directly from the owner.
+
+**Example.** A worker reads a root locally, fetches a parent's `task:<id>:<attempt>` value from another worker, stores a local copy, then resolves the function arguments.
+
+**Why here.** The coordinator can own control metadata without relaying computed object payloads.
+
+**Tradeoffs.** Worker stores have no garbage collector or replica directory. A missing owning store can make data unavailable; a cached copy unknown to the coordinator does not help placement.
+
+**Code and ownership.** [`Worker.load`, `store`, and `execute`](internal/cluster/worker.go#L30), extension.
+
+</details>
+
+<a id="technique-trusted-installed-function-subprocess"></a>
+
+<details>
+<summary>Trusted installed-function subprocess</summary>
+
+**Mechanism.** The Go worker starts a Python child for each task, sends a JSON request over stdin, and invokes a named function only if its module is allowlisted and the function is a top-level function defined by that module. It binds the signature before calling and redirects task stdout away from the machine-readable result channel.
+
+**Example.** The child imports `examples.functions`, checks the named `add` function, calls it with decoded arguments and writes one JSON result record.
+
+**Why here.** Python callers can execute installed Python functions while Go owns assignment, object storage and process scheduling.
+
+**Tradeoffs.** Modules must already be installed and allowlisted on each worker. The child has the worker OS user's permissions; this is not isolation for hostile code, and functions can run again after retries.
+
+**Code and ownership.** [`Worker.execute`](internal/cluster/worker.go#L108) and [`worker_exec.main`](taskruntime/worker_exec.py#L11), extension.
+
+</details>
+
+<a id="technique-layered-execution-deadlines-and-output-budgets"></a>
+
+<details>
+<summary>Layered execution deadlines and output budgets</summary>
+
+**Mechanism.** The coordinator gives each assignment a 15-second lease, worker execution gets a 10-second context, and the Python child gets an 8-second context. RPCs use a three-second timeout, while `Runtime.get` polls until its caller deadline and caps each locate/fetch call to the remaining time. Python output and task error text are bounded before crossing back into runtime state.
+
+**Example.** A blocked Python function is terminated when the child context expires; a caller with a shorter `get` timeout stops polling before the longer task lifecycle bound.
+
+**Why here.** Independent limits bound abandoned work, RPC waits, result/error data and caller waiting.
+
+**Tradeoffs.** These are separate budgets; a caller timeout does not cancel submitted work. A timeout can cause a retry while an earlier operation's external side effects have already occurred.
+
+**Code and ownership.** [`Worker.execute`](internal/cluster/worker.go#L108), [`rpc` and `Runtime.get`](taskruntime/client.py#L36), extension.
+
+</details>
+
+<a id="technique-bounded-json-and-protobuf-boundary"></a>
+
+<details>
+<summary>JSON and protobuf conversion with size checks</summary>
+
+**Mechanism.** The Python client accepts finite JSON-compatible values with string dictionary keys and bounded nesting. Go converts requests through JSON into protobuf `Struct` maps and back; the gRPC server and clients cap messages at 2 MiB. Object and root batches are limited to 1 MiB, task specs to 256 KiB, and submissions check the serialized protobuf assignment plus reserved owner metadata before publishing it.
+
+**Example.** A JSON object that fits 1 MiB but expands beyond the assignment RPC budget is rejected before task and object metadata are inserted.
+
+**Why here.** A shared JSON-shaped value model crosses Python, Go and protobuf without pickle or arbitrary object encoding.
+
+**Tradeoffs.** `Struct` numbers are binary64, so integer precision is bounded; tuples and custom types are not preserved. Protobuf overhead means a value under its JSON cap may still fail the transport budget.
+
+**Code and ownership.** [`validate` and `rpc`](taskruntime/client.py#L16), [`Message`, `Decode`, and size checks](internal/wire/wire.go#L25), protobuf `Struct` schema in [`runtime.proto`](protocol/runtime.proto#L1), mixed extension and protobuf dependency.
+
+</details>
+
+<a id="technique-loopback-capability-authentication"></a>
+
+<details>
+<summary>Loopback capability authentication</summary>
+
+**Mechanism.** Process startup and the wire layer accept numeric IPv4 or IPv6 loopback addresses with a valid nonzero port. The gRPC server requires exactly one authorization metadata value and compares it to the configured token in constant time; clients attach the same shared capability to each call.
+
+**Example.** A peer at `127.0.0.1:7101` with the shared token can fetch an object; a non-loopback address or absent/incorrect token is rejected.
+
+**Why here.** The runtime targets trusted local clusters and restricts both service binding and peer calls to that boundary.
+
+**Tradeoffs.** Transport is plaintext and every holder of the shared token has the same cluster role. This is not a hostile-client or multi-host security design.
+
+**Code and ownership.** [`Loopback`, `Serve`, and `Call`](internal/wire/wire.go#L95) and startup checks in [`main`](cmd/runtime/main.go#L15), extension over gRPC dependency.
+
+</details>
+
+<a id="technique-deadline-bounded-polling"></a>
+
+<details>
+<summary>Deadline-bounded polling</summary>
+
+**Mechanism.** `Runtime.get` computes a monotonic deadline, repeatedly locates the object, fetches it from an accepted owner when done, and bounds each RPC timeout by the remaining caller budget. It retries only unavailable or deadline-exceeded RPC errors and pauses briefly between attempts.
+
+**Example.** With a 150 ms timeout and an unreachable coordinator, `get` raises `TimeoutError` instead of polling forever.
+
+**Why here.** Result retrieval must return within the caller's requested wait budget even while workers or coordinator are unavailable.
+
+**Tradeoffs.** Polling adds repeated locate calls and the caller's timeout does not cancel submitted work. Other RPC error classes surface immediately.
+
+**Code and ownership.** [`Runtime.get`](taskruntime/client.py#L103), extension.
+
+</details>
+
+<a id="technique-dag-recovery-and-failure-assertions"></a>
+
+<details>
+<summary>DAG, recovery, and failure assertions</summary>
+
+**Mechanism.** Focused tests assert externally visible states across coordinator reopen, stale completion, duplicate completion, attempt exhaustion, parent-failure propagation, lost output, invalid input, protobuf budget rejection, worker-store reopen, loopback validation and caller deadlines. They check exact results or named failure conditions, not throughput claims.
+
+**Example.** `TestDurableLineageFencesOldAssignment` reopens metadata, verifies the old attempt is rejected, confirms the next attempt increments, and checks replayed completion is counted once.
+
+**Why here.** Recovery and error semantics are central user-visible behavior for a runtime that reassigns work after process loss.
+
+**Tradeoffs.** Unit-level state and boundary assertions do not replace the separate real-process cluster verification documented above.
+
+**Code and ownership.** [`coordinator_test.go`](internal/cluster/coordinator_test.go#L44), [`wire_test.go`](internal/wire/wire_test.go#L14), and [`test_client.py`](tests/test_client.py#L8), extension.
 
 </details>
